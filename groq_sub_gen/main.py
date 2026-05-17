@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import subprocess
 from pathlib import Path
@@ -64,19 +65,22 @@ def is_go_installed():
         print(f"Error while checking Go installation: {e.stderr.strip()}")
         return False
 
-async def async_main():
+async def async_main(url=None):
     print("Checking for Go installation...")
     if config.RUN_ASB_WEBSOCKET_SERVER and is_go_installed():
         asbplayer_wss = await run_asb_websocket_go_server_nonblocking()
-        
+
     print("Starting Groq Sub Gen...")
 
-    await watcher.main()
+    await watcher.main(url=url)
 
     print("Exiting Groq Sub Gen")
 
 def main():
-    asyncio.run(async_main())
+    parser = argparse.ArgumentParser(description="ASB Auto Subtitle Generator")
+    parser.add_argument("url", nargs="?", help="YouTube URL to process (required when monitor_clipboard is false in config.yaml)")
+    args = parser.parse_args()
+    asyncio.run(async_main(url=args.url))
 
 if __name__ == '__main__':
     main()

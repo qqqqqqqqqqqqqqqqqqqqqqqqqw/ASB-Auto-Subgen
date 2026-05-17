@@ -471,7 +471,7 @@ class SubtitleProcessor:
     # _embed_subtitles method is omitted as it's not used in this workflow
 
 
-async def main():
+async def main(url=None):
     try:
         groq_client = Groq(api_key=config.GROQ_API_KEY, timeout=600)  # Increased timeout to 10 minutes
         if config.process_locally:
@@ -487,6 +487,30 @@ async def main():
         logging.info("Groq client initialized.")
     except Exception as e:
         logging.error(f"Failed to initialize subtitle processing: {e}")
+        return
+
+    if not config.monitor_clipboard:
+        if not url:
+            logging.error("monitor_clipboard is disabled in config.yaml. Provide a YouTube URL as a CLI argument.")
+            return
+        if not is_youtube_url(url):
+            logging.error(f"Invalid YouTube URL: {url}")
+            return
+        logging.info(f"Processing URL from argument: {url}")
+        audio_file_path = None
+        try:
+            audio_file_path = download_audio(url, OUTPUT_DIR)
+            if audio_file_path and os.path.exists(audio_file_path):
+                get_subs(processor, audio_file_path)
+            else:
+                logging.error("Audio download failed or file not found.")
+        finally:
+            if audio_file_path and os.path.exists(audio_file_path):
+                try:
+                    os.remove(audio_file_path)
+                    logging.info(f"Cleaned up downloaded audio file: {audio_file_path}")
+                except OSError as e:
+                    logging.warning(f"Could not remove audio file {audio_file_path}: {e}")
         return
 
     previous_clipboard_content = ""

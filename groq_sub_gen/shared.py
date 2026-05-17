@@ -319,8 +319,9 @@ class Config:
     translation_target_language: str = "en"
     # path_to_watch: str = "./watch"
     cookies: str = ""
+    monitor_clipboard: bool = True
 
-    def __init__(self, process_locally=False, GROQ_API_KEY="", whisper_model="turbo", RUN_ASB_WEBSOCKET_SERVER=True, model="whisper-large-v3-turbo", output_dir="output", language="ja", skip_language_check=False, enable_translation=True, translation_target_language="en", path_to_watch="./watch", cookies="", *args, **kwargs):
+    def __init__(self, process_locally=False, GROQ_API_KEY="", whisper_model="turbo", RUN_ASB_WEBSOCKET_SERVER=True, model="whisper-large-v3-turbo", output_dir="output", language="ja", skip_language_check=False, enable_translation=True, translation_target_language="en", path_to_watch="./watch", cookies="", monitor_clipboard=True, *args, **kwargs):
         self.process_locally = process_locally
         self.GROQ_API_KEY = GROQ_API_KEY
         self.whisper_model = whisper_model
@@ -333,6 +334,7 @@ class Config:
         self.translation_target_language = translation_target_language
         # self.path_to_watch = path_to_watch
         self.cookies = cookies
+        self.monitor_clipboard = monitor_clipboard
 
 
 def parse_config(file_path):
@@ -355,7 +357,7 @@ def download_audio(youtube_url, output_dir="."):
     """Downloads audio from YouTube URL, returns final audio file path."""
     logging.info(f"Attempting to download audio from: {youtube_url}")
     try:
-        with yt_dlp.YoutubeDL({'quiet': True, 'verbose': False, 'skip_download': True}) as ydl:
+        with yt_dlp.YoutubeDL({'quiet': True, 'verbose': False, 'skip_download': True, 'remote_components': ['ejs:github']}) as ydl:
             info_dict_pre = ydl.extract_info(youtube_url, download=False)
             video_id = info_dict_pre.get('id', 'youtube_audio')
             base_filename = os.path.join(output_dir, video_id)
@@ -377,6 +379,7 @@ def download_audio(youtube_url, output_dir="."):
         }],
         'keepvideo': False,
         'noplaylist': True,
+        'remote_components': ['ejs:github'],
     }
 
     if config.cookies:
