@@ -10,3 +10,5 @@ config.yaml
 /build
 /asb_groq_sub.egg-info
 /asb_auto_subgen.egg-info
+/subs
+/.venv

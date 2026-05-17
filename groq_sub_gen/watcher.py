@@ -25,7 +25,7 @@ from groq_sub_gen.shared import *
 # Alternative (less secure):
 
 # Directory to save downloaded audio and generated SRT files
-OUTPUT_DIR = "." # Save in the current directory
+OUTPUT_DIR = config.output_dir
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Configure basic logging
@@ -57,8 +57,8 @@ LANGUAGE_CODES = {
 }
 
 ALLOWED_FILE_EXTENSIONS = ["mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm"]
-MAX_FILE_SIZE_MB = 25
-CHUNK_SIZE_MB = 25
+MAX_FILE_SIZE_MB = 10
+CHUNK_SIZE_MB = 10
 
 # --- Custom Exception ---
 class SubtitleError(Exception):
@@ -98,6 +98,35 @@ class SubtitleProcessor:
                 logging.warning(f"Could not remove temporary file {f}: {e}")
         self._temp_files = []
 
+    def _process_audio_chunk_with_retry(self, current_file_path, timestamp_granularities_list, language, auto_detect_language, model, prompt, max_retries=3):
+        """Process a single audio chunk with retry logic and exponential backoff."""
+        for attempt in range(max_retries):
+            try:
+                with open(current_file_path, "rb") as file_data:
+                    if not self.local_processor:
+                        transcription_response = self.client.audio.transcriptions.create(
+                            file=(os.path.basename(current_file_path), file_data.read()),
+                            model=model, prompt=prompt, response_format="verbose_json",
+                            timestamp_granularities=timestamp_granularities_list,
+                            language=None if auto_detect_language else language, temperature=0.0,
+                        )
+                    else: 
+                        transcription_response = self.local_processor.get_audio_segments(
+                            current_file_path, language=language, word_timestamps=("word" in timestamp_granularities_list),
+                        )
+                return transcription_response
+            except (groq.RateLimitError, groq.APIStatusError) as e:
+                wait_time = min(2 ** attempt, 60)  # Exponential backoff: 1s, 2s, 4s, etc., max 60s
+                if attempt < max_retries - 1:
+                    logging.warning(f"Attempt {attempt + 1}/{max_retries} failed for {os.path.basename(current_file_path)}: {e}. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logging.error(f"All {max_retries} retry attempts failed for {os.path.basename(current_file_path)}.")
+                    raise
+            except Exception as e:
+                logging.error(f"Non-retryable error processing {os.path.basename(current_file_path)}: {e}")
+                raise
+
     def _handle_groq_error(self, e, model_name):
         try:
             error_data = e.args[0]
@@ -121,24 +150,66 @@ class SubtitleProcessor:
         raise SubtitleError(error_message) from e
 
     def _split_audio(self, input_file_path, chunk_size_mb):
-        chunk_size = int(chunk_size_mb * 1024 * 1024)
-        file_number = 1
+        """Split audio file into chunks using ffmpeg for proper audio boundaries."""
         chunks = []
         base_name, extension = os.path.splitext(input_file_path)
         try:
-            with open(input_file_path, 'rb') as f:
-                while True:
-                    chunk = f.read(chunk_size)
-                    if not chunk: break
-                    chunk_name = f"{base_name}_part{file_number:03}{extension}"
-                    with open(chunk_name, 'wb') as chunk_file: chunk_file.write(chunk)
-                    chunks.append(chunk_name)
-                    self._temp_files.append(chunk_name)
-                    file_number += 1
-            if not chunks: raise SubtitleError(f"No chunks created from {input_file_path}.")
-            logging.info(f"Split {input_file_path} into {len(chunks)} chunks.")
+            # First, get the duration of the audio file
+            probe_cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", input_file_path]
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+            probe_data = json.loads(probe_result.stdout)
+            duration = float(probe_data['format']['duration'])
+            
+            # Calculate chunk duration based on actual file bitrate
+            file_size_bytes = os.path.getsize(input_file_path)
+            bitrate_bps = (file_size_bytes * 8) / duration
+            chunk_duration = (chunk_size_mb * 1024 * 1024 * 8) / bitrate_bps
+            
+            num_chunks = int(duration // chunk_duration) + 1
+            actual_chunk_duration = duration / num_chunks
+            
+            logging.info(f"Audio duration: {duration:.2f}s, bitrate: {bitrate_bps/1000:.0f}kbps, splitting into {num_chunks} chunks of ~{actual_chunk_duration:.2f}s each")
+            
+            for i in range(num_chunks):
+                start_time = i * actual_chunk_duration
+                chunk_name = f"{base_name}_part{i+1:03}{extension}"
+                
+                # Use ffmpeg to extract segment without re-encoding
+                cmd = [
+                    "ffmpeg", "-y", "-i", input_file_path,
+                    "-ss", str(start_time), "-t", str(actual_chunk_duration),
+                    "-c", "copy", chunk_name
+                ]
+                self._run_command(cmd)
+                chunks.append(chunk_name)
+                self._temp_files.append(chunk_name)
+                
+            if not chunks:
+                raise SubtitleError(f"No chunks created from {input_file_path}.")
+            logging.info(f"Split {input_file_path} into {len(chunks)} chunks using ffmpeg.")
             return chunks
-        except IOError as e: raise SubtitleError(f"Error splitting file {input_file_path}: {e}") from e
+        except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as e:
+            logging.warning(f"FFmpeg splitting failed: {e}. Falling back to byte-based splitting.")
+            # Fallback to original byte-based splitting if ffmpeg fails
+            chunk_size = int(chunk_size_mb * 1024 * 1024)
+            file_number = 1
+            chunks = []
+            try:
+                with open(input_file_path, 'rb') as f:
+                    while True:
+                        chunk = f.read(chunk_size)
+                        if not chunk: break
+                        chunk_name = f"{base_name}_part{file_number:03}{extension}"
+                        with open(chunk_name, 'wb') as chunk_file: chunk_file.write(chunk)
+                        chunks.append(chunk_name)
+                        self._temp_files.append(chunk_name)
+                        file_number += 1
+                if not chunks: raise SubtitleError(f"No chunks created from {input_file_path}.")
+                logging.info(f"Split {input_file_path} into {len(chunks)} chunks (byte-based fallback).")
+                return chunks
+            except IOError as e: raise SubtitleError(f"Error splitting file {input_file_path}: {e}") from e
+        except Exception as e:
+            raise SubtitleError(f"Unexpected error during audio splitting: {e}") from e
 
     def _merge_files(self, chunks, output_file_path):
         if not chunks: return
@@ -243,10 +314,12 @@ class SubtitleProcessor:
         # Font options kept for compatibility but ignored if include_video is False
         font_selection: str = "Default", font_file_path: str = None,
         font_color: str = "#FFFFFF", font_size: int = 24,
-        outline_thickness: int = 1, outline_color: str = "#000000"
+        outline_thickness: int = 1, outline_color: str = "#000000",
+        chunk_callback=None,
     ):
         self._temp_files = []
         processed_path_or_chunks = None
+        base_filename = os.path.splitext(os.path.basename(output_srt_path))[0]
 
         try:
             if not auto_detect_language and language not in LANGUAGE_CODES.values():
@@ -274,19 +347,11 @@ class SubtitleProcessor:
                 logging.info(f"Processing {'chunk' if is_split else 'file'} {i + 1}/{len(files_to_process)}: {os.path.basename(current_file_path)}")
                 chunk_srt_content = ""
                 try:
-                    with open(current_file_path, "rb") as file_data:
-                        if not self.local_processor:
-                            transcription_response = self.client.audio.transcriptions.create(
-                                file=(os.path.basename(current_file_path), file_data.read()),
-                                model=model, prompt=prompt, response_format="verbose_json",
-                                timestamp_granularities=timestamp_granularities_list,
-                                language=None if auto_detect_language else language, temperature=0.0,
-                            )
-                        else: 
-                            transcription_response = self.local_processor.get_audio_segments(
-                            current_file_path, language=language, word_timestamps=(primary_granularity == "word"),
-                        )
-                            
+                    # Use retry logic for API calls
+                    transcription_response = self._process_audio_chunk_with_retry(
+                        current_file_path, timestamp_granularities_list, language, auto_detect_language, model, prompt
+                    )
+                    
                     # Normalize to a dict for both local and remote.
                     transcription_response = dict(transcription_response)
                     word_data = getattr(transcription_response, 'words', transcription_response.get('words', []))
@@ -336,9 +401,41 @@ class SubtitleProcessor:
 
                     if chunk_srt_content:
                         full_srt_content_list.append(chunk_srt_content)
+                        if chunk_callback:
+                            current_full_srt = "\n".join(full_srt_content_list)
+                            subtitle_payloads = [{
+                                "name": f"{base_filename}.srt",
+                                "base64": base64.b64encode(current_full_srt.encode("utf-8")).decode("utf-8"),
+                            }]
+                            if config.enable_translation:
+                                try:
+                                    translated_full_srt = translate_srt_content(
+                                        current_full_srt,
+                                        source_lang=language,
+                                        target_lang=config.translation_target_language,
+                                    )
+                                    subtitle_payloads.append({
+                                        "name": f"{base_filename}.{config.translation_target_language}.srt",
+                                        "base64": base64.b64encode(translated_full_srt.encode("utf-8")).decode("utf-8"),
+                                    })
+                                except Exception as translation_err:
+                                    logging.warning(
+                                        f"Full SRT translation failed after chunk {i+1}: {translation_err}. Sending original only."
+                                    )
+                            try:
+                                logging.info(f"Sending updated full subtitles after chunk {i+1}/{len(files_to_process)} to asbplayer.")
+                                chunk_callback(subtitle_payloads)
+                            except Exception as callback_err:
+                                logging.warning(
+                                    f"Failed to send updated subtitles after chunk {i+1}: {callback_err}"
+                                )
 
-                except groq.AuthenticationError as e: self._handle_groq_error(e, model)
-                except groq.RateLimitError as e: self._handle_groq_error(e, model)
+                except groq.AuthenticationError as e:
+                    self._handle_groq_error(e, model)
+                except groq.GroqError as e:
+                    logging.error(f"Groq API error processing {os.path.basename(current_file_path)}: {e}", exc_info=True)
+                    logging.warning(f"Skipping chunk {i+1} due to error.")
+                    continue
                 except Exception as e:
                     logging.error(f"Error processing {os.path.basename(current_file_path)}: {e}", exc_info=True)
                     logging.warning(f"Skipping chunk {i+1} due to error.")
@@ -376,7 +473,7 @@ class SubtitleProcessor:
 
 async def main():
     try:
-        groq_client = Groq(api_key=config.GROQ_API_KEY)
+        groq_client = Groq(api_key=config.GROQ_API_KEY, timeout=600)  # Increased timeout to 10 minutes
         if config.process_locally:
             logging.info("Processing subtitles locally.")
             processor = SubtitleProcessor(
@@ -452,6 +549,15 @@ def get_subs(processor, audio_file_path):
         base_filename = os.path.splitext(os.path.basename(audio_file_path))[0]
         output_srt_path = os.path.join(OUTPUT_DIR, f"{base_filename}.srt")
 
+        def chunk_callback(subtitle_payloads):
+            if not subtitle_payloads:
+                return False
+            logging.info(f"Sending subtitle chunk with {len(subtitle_payloads)} file(s) to asbplayer.")
+            success = send_subtitles_payload(subtitle_payloads)
+            if not success:
+                logging.warning("Subtitle chunk send failed.")
+            return success
+
         try:
             srt_path, _ = processor.generate_subtitles(
                                             input_file_path=audio_file_path,
@@ -459,11 +565,24 @@ def get_subs(processor, audio_file_path):
                                             timestamp_granularities_str="segment",
                                             language='ja',
                                             auto_detect_language=False,
-                                            include_video=False
+                                            include_video=False,
+                                            chunk_callback=chunk_callback,
                                         )
             if srt_path:
                 logging.info(f"Subtitles generated successfully: {srt_path}")
-                send_subtitles_http(srt_path)
+                if config.enable_translation:
+                    translated_srt_path = os.path.join(OUTPUT_DIR, f"{base_filename}.{config.translation_target_language}.srt")
+                    try:
+                        translate_srt_file(
+                            srt_path,
+                            translated_srt_path,
+                            source_lang=config.language,
+                            target_lang=config.translation_target_language,
+                        )
+                        logging.info(f"Translated subtitle file written to: {translated_srt_path}")
+                    except SubtitleError as translate_err:
+                        logging.warning(f"Failed to write translated subtitle file: {translate_err}")
+                logging.info("Chunked subtitle delivery completed.")
             else:
                 logging.error("Subtitle generation failed (returned None).")
 

@@ -1,0 +1,11 @@
+GROQ_API_KEY: ''
+RUN_ASB_WEBSOCKET_SERVER: true
+cookies: ''
+language: ja
+model: whisper-large-v3-turbo # for groq
+whisper_model: turbo
+output_dir: subs
+process_locally: false
+skip_language_check: true
+enable_translation: true
+translation_target_language: en

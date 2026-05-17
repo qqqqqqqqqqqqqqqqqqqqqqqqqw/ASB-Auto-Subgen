@@ -5,12 +5,34 @@ import os
 import re
 import subprocess
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import requests
 import yaml
 import yt_dlp
 from dataclasses_json import dataclass_json
+
+BATCH_DELIMITER = "\n<<<SRT_DELIM>>>\n"
+TRANSLATION_BATCH_SIZE = 2000
+TRANSLATION_CACHE_MAXSIZE = 2048
+HTTP_SESSION = requests.Session()
+HTTP_SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
+HTTP_ADAPTER = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
+HTTP_SESSION.mount("https://", HTTP_ADAPTER)
+HTTP_SESSION.mount("http://", HTTP_ADAPTER)
+TRANSLATION_CACHE = OrderedDict()
+
+def _get_cached_translation(text, source_lang, target_lang):
+    return TRANSLATION_CACHE.get((text, source_lang, target_lang))
+
+
+def _cache_translation(text, source_lang, target_lang, translated_text):
+    key = (text, source_lang, target_lang)
+    TRANSLATION_CACHE[key] = translated_text
+    TRANSLATION_CACHE.move_to_end(key)
+    if len(TRANSLATION_CACHE) > TRANSLATION_CACHE_MAXSIZE:
+        TRANSLATION_CACHE.popitem(last=False)
 
 # --- Custom Exception ---
 
@@ -46,37 +68,240 @@ class DirectoryWatcher(threading.Thread):
         logging.info("Stopping directory watcher")
 
 
-def send_subtitles_http(srt_file_path):
-    """
-    Reads an SRT file, encodes it to Base64, and sends it to an HTTP endpoint using requests.
-
-    Args:
-        srt_file_path (str): The path to the generated SRT file.
-    """
+def send_subtitles_payload(subtitle_files):
+    """Send multiple subtitle files in one request to the asbplayer HTTP endpoint."""
     http_url = "http://127.0.0.1:8766/asbplayer/load-subtitles"
+    if not subtitle_files:
+        logging.error("No subtitle files provided for sending.")
+        return False
+    try:
+        response = HTTP_SESSION.post(http_url, json={"files": subtitle_files}, timeout=30)
+        if response.status_code == 200:
+            logging.info(
+                f"Successfully sent {len(subtitle_files)} subtitle files to {http_url}")
+            logging.debug(f"requests response: {response.text}")
+            return True
+        logging.error(
+            f"Failed to send subtitles to {http_url}. requests returned code: {response.status_code}")
+        logging.error(f"requests response text: {response.text}")
+        return False
+    except Exception as e:
+        logging.error(
+            f"An error occurred while sending subtitles via HTTP: {e}")
+        return False
+
+
+def send_subtitles_http(srt_file_path):
+    """Send a single subtitle file through the existing HTTP endpoint."""
     if not os.path.exists(srt_file_path):
         logging.error(f"SRT file does not exist: {srt_file_path}")
-        return
+        return False
     try:
         with open(srt_file_path, 'rb') as f:
             srt_content_bytes = f.read()
         base64_srt = base64.b64encode(srt_content_bytes).decode('utf-8')
         filename = os.path.basename(srt_file_path)
-        post_data = {"files": [{"name": filename, "base64": base64_srt}]}
-        response = requests.post(http_url, json=post_data)
-        if response.status_code == 200:
-            logging.info(
-                f"Successfully sent subtitles in {filename} to {http_url}")
-            logging.debug(f"requests response: {response.text}")
-        else:
-            logging.error(
-                f"Failed to send subtitles to {http_url}. requests returned code: {response.status_code}")
-            logging.error(f"requests response text: {response.text}")
+        return send_subtitles_payload([{"name": filename, "base64": base64_srt}])
     except FileNotFoundError as e:
         logging.error(f"SRT file not found: {srt_file_path}")
+        return False
     except Exception as e:
-        logging.error(
-            f"An error occurred while sending subtitles via HTTP: {e}")
+        logging.error(f"An error occurred while sending subtitles via HTTP: {e}")
+        return False
+
+
+def _parse_srt_blocks(srt_content):
+    blocks = []
+    raw_blocks = [block.strip() for block in srt_content.split("\n\n") if block.strip()]
+    for raw_block in raw_blocks:
+        lines = [line for line in raw_block.splitlines() if line.strip()]
+        if len(lines) < 3:
+            continue
+        if not lines[0].strip().isdigit():
+            continue
+        timing_line = lines[1].strip()
+        if "-->" not in timing_line:
+            continue
+        text = " ".join(line.strip() for line in lines[2:] if line.strip())
+        blocks.append({
+            "index": lines[0].strip(),
+            "timing": timing_line,
+            "text": text,
+        })
+    return blocks
+
+
+def _build_srt_from_blocks(blocks):
+    output_lines = []
+    for block in blocks:
+        output_lines.append(block["index"])
+        output_lines.append(block["timing"])
+        output_lines.append(block["text"])
+        output_lines.append("")
+    return "\n".join(output_lines).strip() + "\n"
+
+
+def _translate_text(text, source_lang, target_lang):
+    """Translate a single text block using Google Translate API."""
+    if not text or not text.strip():
+        return text
+
+    cached_translation = _get_cached_translation(text, source_lang, target_lang)
+    if cached_translation is not None:
+        return cached_translation
+
+    try:
+        url = "https://translate.googleapis.com/translate_a/single"
+        params = {
+            "client": "gtx",
+            "sl": source_lang,
+            "tl": target_lang,
+            "dt": "t",
+            "q": text,
+        }
+        response = HTTP_SESSION.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        translation_data = response.json()
+        # Response structure: [[[translated_text, original_text, ...], ...], ...]
+        if translation_data and isinstance(translation_data[0], list) and translation_data[0]:
+            translated_segments = [segment[0] for segment in translation_data[0] if segment and segment[0]]
+            translated_text = "".join(translated_segments).strip()
+            _cache_translation(text, source_lang, target_lang, translated_text)
+            return translated_text
+        return text
+    except Exception as e:
+        logging.warning(f"Failed to translate text: {e}")
+        return text
+
+
+def _build_translation_batches(texts, max_chars=TRANSLATION_BATCH_SIZE):
+    batches = []
+    current_batch = []
+    current_length = 0
+
+    for text in texts:
+        text_length = len(text)
+        delimiter_length = len(BATCH_DELIMITER) if current_batch else 0
+        if current_batch and current_length + delimiter_length + text_length > max_chars:
+            batches.append(current_batch)
+            current_batch = []
+            current_length = 0
+
+        if current_batch:
+            current_length += len(BATCH_DELIMITER)
+        current_batch.append(text)
+        current_length += text_length
+
+    if current_batch:
+        batches.append(current_batch)
+    return batches
+
+
+def _translate_text_batch(texts, source_lang, target_lang):
+    """Translate a batch of text blocks using Google Translate API."""
+    if not texts:
+        return []
+
+    try:
+        url = "https://translate.googleapis.com/translate_a/single"
+        params = {
+            "client": "gtx",
+            "sl": source_lang,
+            "tl": target_lang,
+            "dt": "t",
+            "q": BATCH_DELIMITER.join(texts),
+        }
+        response = HTTP_SESSION.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        translation_data = response.json()
+        if translation_data and isinstance(translation_data[0], list) and translation_data[0]:
+            translated_combined = "".join(
+                segment[0] for segment in translation_data[0] if segment and segment[0]
+            ).strip()
+            translated_parts = translated_combined.split(BATCH_DELIMITER)
+            if len(translated_parts) == len(texts):
+                clean_parts = [part.strip() for part in translated_parts]
+                for original, translated_text in zip(texts, clean_parts):
+                    _cache_translation(original, source_lang, target_lang, translated_text)
+                return clean_parts
+
+        raise ValueError("Batch translation response did not split correctly")
+    except Exception as e:
+        logging.warning(f"Batch translation failed: {e}. Falling back to individual requests.")
+        return [_translate_text(text, source_lang, target_lang) for text in texts]
+
+
+def translate_srt_content(srt_content, source_lang="ja", target_lang="en"):
+    """Translate all subtitle segments in SRT content."""
+    blocks = _parse_srt_blocks(srt_content)
+    if not blocks:
+        raise SubtitleError("No valid SRT segments found for translation.")
+
+    untranslated_texts = []
+    untranslated_indices = []
+    translated_blocks = [None] * len(blocks)
+
+    for i, block in enumerate(blocks):
+        text = block["text"]
+        if not text or not text.strip():
+            translated_blocks[i] = {
+                "index": block["index"],
+                "timing": block["timing"],
+                "text": text,
+            }
+            continue
+
+        cached_translation = _get_cached_translation(text, source_lang, target_lang)
+        if cached_translation is not None:
+            translated_blocks[i] = {
+                "index": block["index"],
+                "timing": block["timing"],
+                "text": cached_translation,
+            }
+            continue
+
+        untranslated_indices.append(i)
+        untranslated_texts.append(text)
+
+    if untranslated_texts:
+        batches = _build_translation_batches(untranslated_texts)
+        translated_results = []
+        for batch_index, batch in enumerate(batches, start=1):
+            batch_translations = _translate_text_batch(batch, source_lang, target_lang)
+            translated_results.extend(batch_translations)
+            logging.info(
+                f"Translated batch {batch_index}/{len(batches)} "
+                f"({len(translated_results)}/{len(untranslated_texts)} uncached segments)"
+            )
+
+        for idx, translated_text in zip(untranslated_indices, translated_results):
+            translated_blocks[idx] = {
+                "index": blocks[idx]["index"],
+                "timing": blocks[idx]["timing"],
+                "text": translated_text,
+            }
+
+    translated_blocks = [block if block is not None else {
+        "index": blocks[i]["index"],
+        "timing": blocks[i]["timing"],
+        "text": blocks[i]["text"],
+    } for i, block in enumerate(translated_blocks)]
+
+    return _build_srt_from_blocks(translated_blocks)
+
+
+def translate_srt_file(input_srt_path, output_srt_path, source_lang="ja", target_lang="en"):
+    if not os.path.exists(input_srt_path):
+        raise SubtitleError(f"SRT file does not exist: {input_srt_path}")
+    try:
+        with open(input_srt_path, "r", encoding="utf-8") as f:
+            original_content = f.read()
+        translated_content = translate_srt_content(original_content, source_lang, target_lang)
+        with open(output_srt_path, "w", encoding="utf-8") as f:
+            f.write(translated_content)
+        return output_srt_path
+    except Exception as e:
+        raise SubtitleError(f"Failed to translate SRT file: {e}") from e
 
 
 @dataclass_json
@@ -90,10 +315,12 @@ class Config:
     output_dir: str = "output"
     language: str = "ja"
     skip_language_check: bool = False
+    enable_translation: bool = True
+    translation_target_language: str = "en"
     # path_to_watch: str = "./watch"
     cookies: str = ""
 
-    def __init__(self, process_locally=False, GROQ_API_KEY="", whisper_model="turbo", RUN_ASB_WEBSOCKET_SERVER=True, model="whisper-large-v3-turbo", output_dir="output", language="ja", skip_language_check=False, path_to_watch="./watch", cookies="", *args, **kwargs):
+    def __init__(self, process_locally=False, GROQ_API_KEY="", whisper_model="turbo", RUN_ASB_WEBSOCKET_SERVER=True, model="whisper-large-v3-turbo", output_dir="output", language="ja", skip_language_check=False, enable_translation=True, translation_target_language="en", path_to_watch="./watch", cookies="", *args, **kwargs):
         self.process_locally = process_locally
         self.GROQ_API_KEY = GROQ_API_KEY
         self.whisper_model = whisper_model
@@ -102,6 +329,8 @@ class Config:
         self.output_dir = output_dir
         self.language = language
         self.skip_language_check = skip_language_check
+        self.enable_translation = enable_translation
+        self.translation_target_language = translation_target_language
         # self.path_to_watch = path_to_watch
         self.cookies = cookies
 
