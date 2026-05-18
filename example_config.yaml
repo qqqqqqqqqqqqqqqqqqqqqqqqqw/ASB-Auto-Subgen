@@ -10,3 +10,5 @@ skip_language_check: true
 enable_translation: true
 translation_target_language: en
 monitor_clipboard: true # if set to false, pass link as argument instead
+download_lower_audio_quality: false
+downsample_audio: true

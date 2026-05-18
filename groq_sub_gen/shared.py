@@ -320,8 +320,10 @@ class Config:
     # path_to_watch: str = "./watch"
     cookies: str = ""
     monitor_clipboard: bool = True
+    download_lower_audio_quality: bool = False
+    downsample_audio: bool = True
 
-    def __init__(self, process_locally=False, GROQ_API_KEY="", whisper_model="turbo", RUN_ASB_WEBSOCKET_SERVER=True, model="whisper-large-v3-turbo", output_dir="output", language="ja", skip_language_check=False, enable_translation=True, translation_target_language="en", path_to_watch="./watch", cookies="", monitor_clipboard=True, *args, **kwargs):
+    def __init__(self, process_locally=False, GROQ_API_KEY="", whisper_model="turbo", RUN_ASB_WEBSOCKET_SERVER=True, model="whisper-large-v3-turbo", output_dir="output", language="ja", skip_language_check=False, enable_translation=True, translation_target_language="en", path_to_watch="./watch", cookies="", monitor_clipboard=True, download_lower_audio_quality=False, downsample_audio=True, *args, **kwargs):
         self.process_locally = process_locally
         self.GROQ_API_KEY = GROQ_API_KEY
         self.whisper_model = whisper_model
@@ -335,6 +337,8 @@ class Config:
         # self.path_to_watch = path_to_watch
         self.cookies = cookies
         self.monitor_clipboard = monitor_clipboard
+        self.download_lower_audio_quality = download_lower_audio_quality
+        self.downsample_audio = downsample_audio
 
 
 def parse_config(file_path):
@@ -370,7 +374,7 @@ def download_audio(youtube_url, output_dir="."):
     ydl_opts = {
         'quiet': False,
         'verbose': False,
-        'format': 'bestaudio/best',
+        'format': '139/bestaudio/best' if config.download_lower_audio_quality else 'bestaudio/best',
         'outtmpl': f'{base_filename}.%(ext)s',
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',

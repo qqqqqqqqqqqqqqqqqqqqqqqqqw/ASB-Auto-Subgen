@@ -246,6 +246,13 @@ class SubtitleProcessor:
         if file_size_mb <= MAX_FILE_SIZE_MB:
             logging.info(f"File '{os.path.basename(input_file_path)}' ({file_size_mb:.2f} MB) within size limit.")
             return input_file_path, None
+        if not config.downsample_audio:
+            logging.warning(f"File ({file_size_mb:.2f} MB) > limit ({MAX_FILE_SIZE_MB} MB). Downsampling disabled — splitting directly.")
+            try:
+                chunks = self._split_audio(input_file_path, CHUNK_SIZE_MB)
+                return chunks, "split"
+            except (OSError, SubtitleError) as e:
+                raise SubtitleError(f"Error during file preparation: {e}") from e
         logging.warning(f"File ({file_size_mb:.2f} MB) > limit ({MAX_FILE_SIZE_MB} MB). Attempting downsample.")
         output_file_path = os.path.splitext(input_file_path)[0] + "_downsampled.mp3"
         cmd = ["ffmpeg", "-y", "-i", input_file_path, "-ar", "16000", "-ab", "128k", "-ac", "1", "-f", "mp3", output_file_path]
