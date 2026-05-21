@@ -376,11 +376,6 @@ def download_audio(youtube_url, output_dir="."):
         'verbose': False,
         'format': '139/bestaudio/best' if config.download_lower_audio_quality else 'bestaudio/best',
         'outtmpl': f'{base_filename}.%(ext)s',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
         'keepvideo': False,
         'noplaylist': True,
         'remote_components': ['ejs:github'],
@@ -388,36 +383,18 @@ def download_audio(youtube_url, output_dir="."):
 
     if config.cookies:
         ydl_opts['cookiesfrombrowser'] = (config.cookies,)
-    final_audio_path = f"{base_filename}.mp3"
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            logging.info("Starting download and audio extraction...")
+            logging.info("Starting download...")
             info_dict = ydl.extract_info(youtube_url, download=True)
+            final_audio_path = ydl.prepare_filename(info_dict)
             if os.path.exists(final_audio_path):
-                logging.info(
-                    f"Audio download and conversion successful: {final_audio_path}")
+                logging.info(f"Audio download successful: {final_audio_path}")
                 return final_audio_path
             else:
-                downloaded_path = ydl.prepare_filename(info_dict)
-                if downloaded_path and downloaded_path.endswith('.mp3') and os.path.exists(downloaded_path):
-                    logging.warning(
-                        "yt-dlp returned a different filename than expected, using it.")
-                    if downloaded_path != final_audio_path:
-                        try:
-                            os.rename(downloaded_path, final_audio_path)
-                            logging.info(
-                                f"Renamed {downloaded_path} to {final_audio_path}")
-                            return final_audio_path
-                        except OSError as rename_err:
-                            logging.error(
-                                f"Failed to rename downloaded file: {rename_err}")
-                            return downloaded_path
-                    else:
-                        return final_audio_path
-                else:
-                    raise SubtitleError(
-                        f"Expected audio file not found after download: {final_audio_path}")
+                raise SubtitleError(
+                    f"Expected audio file not found after download: {final_audio_path}")
 
     except yt_dlp.utils.DownloadError as e:
         logging.error(f"yt-dlp download error: {e}")
