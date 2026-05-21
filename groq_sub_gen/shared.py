@@ -361,7 +361,7 @@ def download_audio(youtube_url, output_dir="."):
     """Downloads audio from YouTube URL, returns final audio file path."""
     logging.info(f"Attempting to download audio from: {youtube_url}")
     try:
-        with yt_dlp.YoutubeDL({'quiet': True, 'verbose': False, 'skip_download': True, 'remote_components': ['ejs:github']}) as ydl:
+        with yt_dlp.YoutubeDL({'quiet': True, 'verbose': False, 'skip_download': True, 'noplaylist': True, 'remote_components': ['ejs:github']}) as ydl:
             info_dict_pre = ydl.extract_info(youtube_url, download=False)
             video_id = info_dict_pre.get('id', 'youtube_audio')
             base_filename = os.path.join(output_dir, video_id)
