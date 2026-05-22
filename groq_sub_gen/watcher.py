@@ -420,6 +420,12 @@ class SubtitleProcessor:
                                         current_full_srt,
                                         source_lang=language,
                                         target_lang=config.translation_target_language,
+                                        translation_service=config.translation_service,
+                                        groq_client=self.client if config.translation_service == "groq" else None,
+                                        groq_model=config.groq_translation_model,
+                                        temperature=config.translation_temperature,
+                                        groq_batch_segments=config.groq_translation_batch_segments,
+                                        groq_batch_delay=config.groq_translation_batch_delay,
                                     )
                                     subtitle_payloads.append({
                                         "name": f"{base_filename}.{config.translation_target_language}.srt",
@@ -479,6 +485,27 @@ class SubtitleProcessor:
 
 
 async def main(url=None):
+    if url and url.lower().endswith(".srt") and os.path.exists(url):
+        groq_client = Groq(api_key=config.GROQ_API_KEY, timeout=600) if config.translation_service == "groq" else None
+        base = os.path.splitext(url)[0]
+        output_path = f"{base}.{config.translation_target_language}.srt"
+        try:
+            translate_srt_file(
+                url, output_path,
+                source_lang=config.language,
+                target_lang=config.translation_target_language,
+                translation_service=config.translation_service,
+                groq_client=groq_client,
+                groq_model=config.groq_translation_model,
+                temperature=config.translation_temperature,
+                groq_batch_segments=config.groq_translation_batch_segments,
+                groq_batch_delay=config.groq_translation_batch_delay,
+            )
+            logging.info(f"Translated subtitle file written to: {output_path}")
+        except SubtitleError as e:
+            logging.error(f"Translation failed: {e}")
+        return
+
     try:
         groq_client = Groq(api_key=config.GROQ_API_KEY, timeout=600)  # Increased timeout to 10 minutes
         if config.process_locally:
@@ -506,9 +533,9 @@ async def main(url=None):
         logging.info(f"Processing URL from argument: {url}")
         audio_file_path = None
         try:
-            audio_file_path = download_audio(url, OUTPUT_DIR)
+            audio_file_path, video_title, channel_name = download_audio(url, OUTPUT_DIR)
             if audio_file_path and os.path.exists(audio_file_path):
-                get_subs(processor, audio_file_path)
+                get_subs(processor, audio_file_path, groq_client=groq_client, video_title=video_title, channel_name=channel_name)
             else:
                 logging.error("Audio download failed or file not found.")
         finally:
@@ -533,11 +560,11 @@ async def main(url=None):
                     if is_language_desired(current_clipboard_content, 'ja'):
                         audio_file_path = None
                         try:
-                            audio_file_path = download_audio(current_clipboard_content, OUTPUT_DIR)
+                            audio_file_path, video_title, channel_name = download_audio(current_clipboard_content, OUTPUT_DIR)
 
                             if audio_file_path and os.path.exists(audio_file_path):
                                 logging.info(f"Audio downloaded to: {audio_file_path}")
-                                get_subs(processor, audio_file_path)
+                                get_subs(processor, audio_file_path, groq_client=groq_client, video_title=video_title, channel_name=channel_name)
 
                             else:
                                 logging.error("Audio download failed or file not found.")
@@ -558,7 +585,7 @@ async def main(url=None):
                         return
                     
                     if audio and os.path.exists(audio):
-                        get_subs(processor, audio)
+                        get_subs(processor, audio, groq_client=groq_client, video_title=os.path.basename(path), channel_name="")
                         logging.info(f"Audio extracted from local video: {audio}")
                     else:
                         logging.error("Audio extraction failed.")
@@ -575,7 +602,7 @@ async def main(url=None):
             logging.error(f"Error in main loop: {loop_err}", exc_info=True)
             time.sleep(5)
 
-def get_subs(processor, audio_file_path):
+def get_subs(processor, audio_file_path, groq_client=None, video_title="", channel_name=""):
         processor: SubtitleProcessor
         base_filename = os.path.splitext(os.path.basename(audio_file_path))[0]
         output_srt_path = os.path.join(OUTPUT_DIR, f"{base_filename}.srt")
@@ -609,6 +636,14 @@ def get_subs(processor, audio_file_path):
                             translated_srt_path,
                             source_lang=config.language,
                             target_lang=config.translation_target_language,
+                            translation_service=config.translation_service,
+                            groq_client=groq_client if config.translation_service == "groq" else None,
+                            groq_model=config.groq_translation_model,
+                            temperature=config.translation_temperature,
+                            video_title=video_title,
+                            channel_name=channel_name,
+                            groq_batch_segments=config.groq_translation_batch_segments,
+                            groq_batch_delay=config.groq_translation_batch_delay,
                         )
                         logging.info(f"Translated subtitle file written to: {translated_srt_path}")
                     except SubtitleError as translate_err:

@@ -78,7 +78,7 @@ async def async_main(url=None):
 
 def main():
     parser = argparse.ArgumentParser(description="ASB Auto Subtitle Generator")
-    parser.add_argument("url", nargs="?", help="YouTube URL to process (required when monitor_clipboard is false in config.yaml)")
+    parser.add_argument("url", nargs="?", help="YouTube URL to process, or path to an .srt file to translate directly")
     args = parser.parse_args()
     asyncio.run(async_main(url=args.url))
 
