@@ -8,8 +8,9 @@ output_dir: subs
 process_locally: false
 skip_language_check: true
 enable_translation: true
-translation_service: google # "google" or "groq"
-groq_translation_model: llama-3.3-70b-versatile
+translation_service: whisper # "google", "groq", or "whisper" (whisper = Groq Whisper audio translation, English output only)
+whisper_translation_model: whisper-large-v3 # model for whisper audio translation (whisper-large-v3 required)
+#groq_translation_model: llama-3.3-70b-versatile
 translation_temperature: 0.0
 groq_translation_batch_segments: 50 # segments per Groq translation request
 groq_translation_batch_delay: 5.0   # seconds between batches (Groq free tier: ~30 RPM)

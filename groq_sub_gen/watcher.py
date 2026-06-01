@@ -127,6 +127,29 @@ class SubtitleProcessor:
                 logging.error(f"Non-retryable error processing {os.path.basename(current_file_path)}: {e}")
                 raise
 
+    def _process_translation_chunk_with_retry(self, current_file_path, model, prompt, max_retries=3):
+        """Process a single audio chunk through the Whisper translation endpoint with retry logic."""
+        for attempt in range(max_retries):
+            try:
+                with open(current_file_path, "rb") as file_data:
+                    translation_response = self.client.audio.translations.create(
+                        file=(os.path.basename(current_file_path), file_data.read()),
+                        model=model, prompt=prompt, response_format="verbose_json",
+                        temperature=0.0,
+                    )
+                return translation_response
+            except (groq.RateLimitError, groq.APIStatusError) as e:
+                wait_time = min(2 ** attempt, 60)
+                if attempt < max_retries - 1:
+                    logging.warning(f"Whisper translation attempt {attempt + 1}/{max_retries} failed for {os.path.basename(current_file_path)}: {e}. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logging.error(f"All {max_retries} whisper translation retry attempts failed for {os.path.basename(current_file_path)}.")
+                    raise
+            except Exception as e:
+                logging.error(f"Non-retryable error in whisper translation for {os.path.basename(current_file_path)}: {e}")
+                raise
+
     def _handle_groq_error(self, e, model_name):
         try:
             error_data = e.args[0]
@@ -414,7 +437,7 @@ class SubtitleProcessor:
                                 "name": f"{base_filename}.srt",
                                 "base64": base64.b64encode(current_full_srt.encode("utf-8")).decode("utf-8"),
                             }]
-                            if config.enable_translation:
+                            if config.enable_translation and config.translation_service != "whisper":
                                 try:
                                     translated_full_srt = translate_srt_content(
                                         current_full_srt,
@@ -480,6 +503,91 @@ class SubtitleProcessor:
             raise SubtitleError("An unexpected critical error occurred.") from e
         finally:
              self._cleanup_temp_files()
+
+    def generate_whisper_translations(
+        self,
+        input_file_path: str,
+        output_srt_path: str,
+        model: str = "whisper-large-v3",
+        prompt: str = "",
+    ):
+        """Generate English subtitles directly from audio using the Whisper translations endpoint."""
+        self._temp_files = []
+        try:
+            processed_path_or_chunks, status = self._check_and_prepare_file(input_file_path, split=True)
+            is_split = (status == "split")
+
+            files_to_process = processed_path_or_chunks if is_split else [processed_path_or_chunks]
+            full_srt_content_list = []
+            total_duration_offset = 0.0
+            srt_entry_offset = 0
+
+            for i, current_file_path in enumerate(files_to_process):
+                logging.info(f"Whisper translating {'chunk' if is_split else 'file'} {i + 1}/{len(files_to_process)}: {os.path.basename(current_file_path)}")
+                chunk_srt_content = ""
+                try:
+                    translation_response = self._process_translation_chunk_with_retry(
+                        current_file_path, model, prompt
+                    )
+                    translation_response = dict(translation_response)
+                    segment_data = translation_response.get('segments', [])
+
+                    if segment_data:
+                        adjusted_segment_data = []
+                        max_original_id = -1
+                        last_end_time_in_chunk = 0.0
+                        for entry_obj in segment_data:
+                            entry = entry_obj if isinstance(entry_obj, dict) else entry_obj.__dict__
+                            adjusted_entry = entry.copy()
+                            adjusted_entry['start'] = entry.get('start', 0.0) + total_duration_offset
+                            adjusted_entry['end'] = entry.get('end', 0.0) + total_duration_offset
+                            last_end_time_in_chunk = max(last_end_time_in_chunk, adjusted_entry['end'])
+                            original_id = entry.get('id', -1)
+                            max_original_id = max(max_original_id, original_id)
+                            adjusted_entry['id'] = original_id
+                            adjusted_segment_data.append(adjusted_entry)
+                        for j, entry in enumerate(adjusted_segment_data):
+                            entry['id'] = srt_entry_offset + j
+                        chunk_srt_content = self._json_to_srt(adjusted_segment_data)
+                        total_duration_offset = last_end_time_in_chunk
+                        srt_entry_offset += (max_original_id + 1)
+                    else:
+                        logging.warning(f"Whisper translations returned no segments for {os.path.basename(current_file_path)}.")
+
+                    if chunk_srt_content:
+                        full_srt_content_list.append(chunk_srt_content)
+
+                except groq.GroqError as e:
+                    logging.error(f"Groq API error during whisper translation of {os.path.basename(current_file_path)}: {e}", exc_info=True)
+                    logging.warning(f"Skipping translation chunk {i+1} due to error.")
+                    continue
+                except Exception as e:
+                    logging.error(f"Error during whisper translation of {os.path.basename(current_file_path)}: {e}", exc_info=True)
+                    logging.warning(f"Skipping translation chunk {i+1} due to error.")
+                    continue
+
+            if not full_srt_content_list:
+                logging.warning("No whisper translation content was generated.")
+                return None
+
+            final_srt_content = "\n".join(full_srt_content_list)
+            try:
+                with open(output_srt_path, "w", encoding="utf-8") as f:
+                    f.write(final_srt_content)
+                logging.info(f"Whisper translation SRT written: {output_srt_path}")
+            except IOError as e:
+                raise SubtitleError(f"Failed to write whisper translation SRT to {output_srt_path}: {e}") from e
+
+            return output_srt_path
+
+        except (FileNotFoundError, ValueError, SubtitleError, groq.GroqError) as e:
+            logging.error(f"Whisper translation failed: {e}", exc_info=False)
+            raise
+        except Exception as e:
+            logging.critical(f"Unexpected error during whisper translation: {e}", exc_info=True)
+            raise SubtitleError("Unexpected critical error during whisper translation.") from e
+        finally:
+            self._cleanup_temp_files()
 
     # _embed_subtitles method is omitted as it's not used in this workflow
 
@@ -631,21 +739,39 @@ def get_subs(processor, audio_file_path, groq_client=None, video_title="", chann
                 if config.enable_translation:
                     translated_srt_path = os.path.join(OUTPUT_DIR, f"{base_filename}.{config.translation_target_language}.srt")
                     try:
-                        translate_srt_file(
-                            srt_path,
-                            translated_srt_path,
-                            source_lang=config.language,
-                            target_lang=config.translation_target_language,
-                            translation_service=config.translation_service,
-                            groq_client=groq_client if config.translation_service == "groq" else None,
-                            groq_model=config.groq_translation_model,
-                            temperature=config.translation_temperature,
-                            video_title=video_title,
-                            channel_name=channel_name,
-                            groq_batch_segments=config.groq_translation_batch_segments,
-                            groq_batch_delay=config.groq_translation_batch_delay,
-                        )
-                        logging.info(f"Translated subtitle file written to: {translated_srt_path}")
+                        if config.translation_service == "whisper":
+                            whisper_srt = processor.generate_whisper_translations(
+                                audio_file_path,
+                                translated_srt_path,
+                                model=config.whisper_translation_model,
+                                prompt="",
+                            )
+                            if whisper_srt:
+                                logging.info(f"Whisper translation SRT written to: {whisper_srt}")
+                                with open(srt_path, "rb") as f:
+                                    src_b64 = base64.b64encode(f.read()).decode("utf-8")
+                                with open(whisper_srt, "rb") as f:
+                                    trans_b64 = base64.b64encode(f.read()).decode("utf-8")
+                                chunk_callback([
+                                    {"name": f"{base_filename}.srt", "base64": src_b64},
+                                    {"name": f"{base_filename}.{config.translation_target_language}.srt", "base64": trans_b64},
+                                ])
+                        else:
+                            translate_srt_file(
+                                srt_path,
+                                translated_srt_path,
+                                source_lang=config.language,
+                                target_lang=config.translation_target_language,
+                                translation_service=config.translation_service,
+                                groq_client=groq_client if config.translation_service == "groq" else None,
+                                groq_model=config.groq_translation_model,
+                                temperature=config.translation_temperature,
+                                video_title=video_title,
+                                channel_name=channel_name,
+                                groq_batch_segments=config.groq_translation_batch_segments,
+                                groq_batch_delay=config.groq_translation_batch_delay,
+                            )
+                            logging.info(f"Translated subtitle file written to: {translated_srt_path}")
                     except SubtitleError as translate_err:
                         logging.warning(f"Failed to write translated subtitle file: {translate_err}")
                 logging.info("Chunked subtitle delivery completed.")

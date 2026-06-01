@@ -435,6 +435,7 @@ class Config:
     enable_translation: bool = True
     translation_target_language: str = "en"
     translation_service: str = "google"
+    whisper_translation_model: str = "whisper-large-v3"
     groq_translation_model: str = "llama-3.3-70b-versatile"
     translation_temperature: float = 0.0
     groq_translation_batch_segments: int = 15
@@ -445,7 +446,7 @@ class Config:
     download_lower_audio_quality: bool = False
     downsample_audio: bool = True
 
-    def __init__(self, process_locally=False, GROQ_API_KEY="", whisper_model="turbo", RUN_ASB_WEBSOCKET_SERVER=True, model="whisper-large-v3-turbo", output_dir="output", language="ja", skip_language_check=False, enable_translation=True, translation_target_language="en", translation_service="google", groq_translation_model="llama-3.3-70b-versatile", translation_temperature=0.0, groq_translation_batch_segments=15, groq_translation_batch_delay=2.0, path_to_watch="./watch", cookies="", monitor_clipboard=True, download_lower_audio_quality=False, downsample_audio=True, *args, **kwargs):
+    def __init__(self, process_locally=False, GROQ_API_KEY="", whisper_model="turbo", RUN_ASB_WEBSOCKET_SERVER=True, model="whisper-large-v3-turbo", output_dir="output", language="ja", skip_language_check=False, enable_translation=True, translation_target_language="en", translation_service="google", whisper_translation_model="whisper-large-v3", groq_translation_model="llama-3.3-70b-versatile", translation_temperature=0.0, groq_translation_batch_segments=15, groq_translation_batch_delay=2.0, path_to_watch="./watch", cookies="", monitor_clipboard=True, download_lower_audio_quality=False, downsample_audio=True, *args, **kwargs):
         self.process_locally = process_locally
         self.GROQ_API_KEY = GROQ_API_KEY
         self.whisper_model = whisper_model
@@ -457,6 +458,7 @@ class Config:
         self.enable_translation = enable_translation
         self.translation_target_language = translation_target_language
         self.translation_service = translation_service
+        self.whisper_translation_model = whisper_translation_model
         self.groq_translation_model = groq_translation_model
         self.translation_temperature = translation_temperature
         self.groq_translation_batch_segments = groq_translation_batch_segments
